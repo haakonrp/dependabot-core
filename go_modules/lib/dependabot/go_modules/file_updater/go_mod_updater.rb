@@ -10,6 +10,7 @@ require "dependabot/go_modules/file_updater"
 require "dependabot/go_modules/go_work_parser"
 require "dependabot/go_modules/replace_stubber"
 require "dependabot/go_modules/resolvability_errors"
+require "dependabot/go_modules/version"
 
 module Dependabot
   module GoModules
@@ -222,10 +223,12 @@ module Dependabot
               substitute_all(substitutions.invert)
             end
 
-            updated_go_sum = original_go_sum ? File.read("go.sum") : nil
             updated_go_mod = File.read("go.mod")
 
-            { go_mod: updated_go_mod, go_sum: updated_go_sum }
+            result = T.let({ go_mod: updated_go_mod }, T::Hash[Symbol, String])
+            result[:go_sum] = reconcile_go_sum(original_go_sum, File.read("go.sum")) if original_go_sum
+
+            result
           end
         end
 
@@ -415,6 +418,115 @@ module Dependabot
             FileUtils.touch(File.join(stub_path, "go.mod"))
             FileUtils.touch(File.join(stub_path, "main.go"))
           end
+        end
+
+        sig { params(original_go_sum: String, updated_go_sum: String).returns(String) }
+        def reconcile_go_sum(original_go_sum, updated_go_sum)
+          original_lines = original_go_sum.lines(chomp: true).reject(&:empty?)
+          updated_lines = updated_go_sum.lines(chomp: true).reject(&:empty?)
+          updated_set = updated_lines.to_set
+          updated_module_versions = extract_module_versions(updated_lines)
+
+          restored_lines = find_restorable_go_mod_lines(original_lines, updated_set, updated_module_versions)
+          return updated_go_sum if restored_lines.empty?
+
+          (updated_lines + restored_lines).sort! { |a, b| go_sum_line_compare(a, b) }.join("\n") + "\n"
+        end
+
+        sig do
+          params(
+            original_lines: T::Array[String],
+            updated_set: T::Set[String],
+            updated_module_versions: T::Set[String]
+          ).returns(T::Array[String])
+        end
+        def find_restorable_go_mod_lines(original_lines, updated_set, updated_module_versions)
+          original_lines.filter_map do |line|
+            next unless go_mod_checksum_line?(line)
+            next if updated_set.include?(line)
+
+            module_path = go_sum_module_path(line)
+            next unless module_path
+            next if updated_dependency_names.include?(module_path)
+
+            module_version = extract_module_version_from_go_mod_line(line)
+            next unless module_version
+            next unless updated_module_versions.include?(module_version)
+
+            line
+          end
+        end
+
+        sig { params(line: String).returns(T::Boolean) }
+        def go_mod_checksum_line?(line)
+          line.include?("/go.mod h1:")
+        end
+
+        sig { params(line: String).returns(T.nilable(String)) }
+        def go_sum_module_path(line)
+          line.split(/\s+/, 2).first
+        end
+
+        # Extracts "module/path vX.Y.Z" from a /go.mod checksum line
+        sig { params(line: String).returns(T.nilable(String)) }
+        def extract_module_version_from_go_mod_line(line)
+          match = line.match(%r{^(\S+)\s+(\S+)/go\.mod\s})
+          return nil unless match
+
+          "#{match[1]} #{match[2]}"
+        end
+
+        # Builds a set of "module/path vX.Y.Z" pairs from non-/go.mod lines in go.sum
+        sig { params(lines: T::Array[String]).returns(T::Set[String]) }
+        def extract_module_versions(lines)
+          lines.each_with_object(Set.new) do |line, set|
+            next if go_mod_checksum_line?(line)
+
+            parts = line.split(/\s+/, 3)
+            next unless parts.length >= 2
+
+            set.add("#{parts[0]} #{parts[1]}")
+          end
+        end
+
+        sig { returns(T::Set[String]) }
+        def updated_dependency_names
+          @updated_dependency_names ||= T.let(dependencies.to_set(&:name), T.nilable(T::Set[String]))
+        end
+
+        # Compares two go.sum lines using Go's module-aware sort order:
+        # sort by module path, then semver version, then /go.mod suffix last.
+        sig { params(line_a: String, line_b: String).returns(Integer) }
+        def go_sum_line_compare(line_a, line_b)
+          path_a, version_rest_a = line_a.split(/\s+/, 2)
+          path_b, version_rest_b = line_b.split(/\s+/, 2)
+
+          path_cmp = T.must((path_a || "") <=> (path_b || ""))
+          return path_cmp unless path_cmp.zero?
+
+          compare_go_versions(version_rest_a || "", version_rest_b || "")
+        end
+
+        # Compares version+suffix portions of go.sum lines using GoModules::Version.
+        sig { params(ver_a: String, ver_b: String).returns(Integer) }
+        def compare_go_versions(ver_a, ver_b)
+          a_is_gomod = ver_a.include?("/go.mod")
+          b_is_gomod = ver_b.include?("/go.mod")
+
+          # Extract raw version token (e.g., "v0.6.0" from "v0.6.0/go.mod h1:...")
+          raw_a = ver_a.split(%r{(/go\.mod)?\s}, 2).first || ""
+          raw_b = ver_b.split(%r{(/go\.mod)?\s}, 2).first || ""
+
+          ver_cmp = go_version_compare(raw_a, raw_b)
+          return ver_cmp unless ver_cmp.zero?
+
+          # Same version: zip hash line sorts before /go.mod line
+          (a_is_gomod ? 1 : 0) <=> (b_is_gomod ? 1 : 0)
+        end
+
+        sig { params(ver_a: String, ver_b: String).returns(Integer) }
+        def go_version_compare(ver_a, ver_b)
+          T.must(Dependabot::GoModules::Version.new(ver_a) <=> Dependabot::GoModules::Version.new(ver_b))
         end
 
         # Given a go.mod file, find all `replace` directives pointing to a path
